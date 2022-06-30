@@ -94,3 +94,8 @@ ENV/
 files.txt
 
 go.py
+
+# Our own outputs
+*.csv
+*.json
+*.jsonl
