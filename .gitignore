@@ -99,3 +99,5 @@ go.py
 *.csv
 *.json
 *.jsonl
+*.gz
+*.bz2
