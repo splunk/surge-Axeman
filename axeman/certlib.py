@@ -101,12 +101,14 @@ async def populate_work(work_deque, log_info, start=0):
 
         end = start + block_size + 1
 
-def add_all_domains(cert_data):
+def add_all_domains(cert_data, surge=False):
     all_domains = []
 
     # Apparently we have certificates with null CNs....what?
     if cert_data['leaf_cert']['subject']['CN']:
         all_domains.append(cert_data['leaf_cert']['subject']['CN'])
+    else:
+        all_domains.append(None)
 
     SAN = cert_data['leaf_cert']['extensions'].get('subjectAltName')
 

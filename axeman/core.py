@@ -16,6 +16,12 @@ import aioprocessing
 import logging
 import locale
 
+import json
+
+import bz2
+
+from functools import partial
+
 try:
     locale.setlocale(locale.LC_ALL, 'en_US')
 except:
@@ -73,7 +79,7 @@ async def queue_monitor(log_info, work_deque, download_results_queue):
         ))
         await asyncio.sleep(2)
 
-async def retrieve_certificates(loop, url=None, ctl_offset=0, output_directory='/tmp/', concurrency_count=DOWNLOAD_CONCURRENCY):
+async def retrieve_certificates(loop, url=None, ctl_offset=0, output_directory='/tmp/', concurrency_count=DOWNLOAD_CONCURRENCY, surge=False):
     async with aiohttp.ClientSession(loop=loop, conn_timeout=10) as session:
         ctl_logs = await certlib.retrieve_all_ctls(session)
 
@@ -104,7 +110,7 @@ async def retrieve_certificates(loop, url=None, ctl_offset=0, output_directory='
                 for _ in range(concurrency_count)
             ])
 
-            processing_task    = asyncio.ensure_future(processing_coro(download_results_queue, output_dir=output_directory))
+            processing_task    = asyncio.ensure_future(processing_coro(download_results_queue, output_dir=output_directory, surge=surge))
             queue_monitor_task = asyncio.ensure_future(queue_monitor(log_info, work_deque, download_results_queue))
 
             asyncio.ensure_future(download_tasks)
@@ -124,9 +130,9 @@ async def retrieve_certificates(loop, url=None, ctl_offset=0, output_directory='
 
             logging.info("Finished downloading and processing {}".format(log_info['url']))
 
-async def processing_coro(download_results_queue, output_dir="/tmp"):
+async def processing_coro(download_results_queue, output_dir="/tmp", surge=False):
     logging.info("Starting processing coro and process pool")
-    process_pool = aioprocessing.AioPool(initargs=(output_dir,))
+    process_pool = aioprocessing.AioPool(initargs=(output_dir))
 
     done = False
 
@@ -143,16 +149,22 @@ async def processing_coro(download_results_queue, output_dir="/tmp"):
 
         logging.debug("Got a chunk of {}. Mapping into process pool".format(process_pool.pool_workers))
 
-
+        logging.info("***** SURGe: Getting entries.")
         for entry in entries_iter:
-            csv_storage = '{}/certificates/{}'.format(output_dir, entry['log_info']['url'].replace('/', '_'))
-            if not os.path.exists(csv_storage):
+            output_storage = '{}/certificates/{}'.format(output_dir, entry['log_info']['url'].replace('/', '_'))
+            if not os.path.exists(output_storage):
                 print("[{}] Making dir...".format(os.getpid()))
-                os.makedirs(csv_storage)
-            entry['log_dir']=csv_storage
+                os.makedirs(output_storage)
+            entry['log_dir']=output_storage
+
+        logging.info("***** SURGe: Got entries.")
 
         if len(entries_iter) > 0:
-            await process_pool.coro_map(process_worker, entries_iter)
+            logging.info("***** SURGe: Mapping process_worker")
+#            await process_pool.coro_map(process_worker, entries_iter)
+            await process_pool.coro_map(partial(process_worker, surge=surge), entries_iter)
+
+            logging.info("***** SURGe: Process worker done.")
 
         logging.debug("Done mapping! Got results")
 
@@ -163,13 +175,25 @@ async def processing_coro(download_results_queue, output_dir="/tmp"):
 
     await process_pool.coro_join()
 
-def process_worker(result_info):
+def process_worker(result_info, **kwargs):
     logging.debug("Worker {} starting...".format(os.getpid()))
+    logging.info(f"***** SURGe: Worker {os.getpid()} starting...")
+    logging.info(f"***** SURGE: kwargs: {kwargs}")
+
+    if "surge" in kwargs.keys():
+        surge = kwargs['surge']
+    else:
+        surge = False
+
     if not result_info:
         return
     try:
-        csv_storage = result_info['log_dir']
-        csv_file = "{}/{}-{}.csv".format(csv_storage, result_info['start'], result_info['end'])
+        output_storage = result_info['log_dir']
+        if surge:
+            output_file = "{}/{}-{}.json".format(output_storage, result_info['start'], result_info['end'])
+        else:
+            output_file = "{}/{}-{}.csv".format(output_storage, result_info['start'], result_info['end'])
+
 
         lines = []
 
@@ -178,7 +202,7 @@ def process_worker(result_info):
             mtl = certlib.MerkleTreeHeader.parse(base64.b64decode(entry['leaf_input']))
 
             cert_data = {}
-
+            
             if mtl.LogEntryType == "X509LogEntryType":
                 cert_data['type'] = "X509LogEntry"
                 chain = [crypto.load_certificate(crypto.FILETYPE_ASN1, certlib.Certificate.parse(mtl.Entry).CertData)]
@@ -195,12 +219,17 @@ def process_worker(result_info):
                         crypto.load_certificate(crypto.FILETYPE_ASN1, cert.CertData)
                     )
 
+            chain_subjects = list()
+            for cert in chain:
+                subject = cert.get_subject()
+                chain_subjects.append(repr(subject)[18:-2])
+
             cert_data.update({
                 "leaf_cert": certlib.dump_cert(chain[0]),
                 "chain": [certlib.dump_cert(x) for x in chain[1:]]
             })
 
-            certlib.add_all_domains(cert_data)
+            certlib.add_all_domains(cert_data, surge=surge)
 
             cert_data['source'] = {
                 "url": result_info['log_info']['url'],
@@ -209,23 +238,52 @@ def process_worker(result_info):
             chain_hash = hashlib.sha256("".join([x['as_der'] for x in cert_data['chain']]).encode('ascii')).hexdigest()
 
             # header = "url, cert_index, chain_hash, cert_der, all_domains, not_before, not_after"
-            lines.append(
-                ",".join([
-                    result_info['log_info']['url'],
-                    str(entry['cert_index']),
-                    chain_hash,
-                    cert_data['leaf_cert']['as_der'],
-                    ' '.join(cert_data['leaf_cert']['all_domains']),
-                    str(cert_data['leaf_cert']['not_before']),
-                    str(cert_data['leaf_cert']['not_after'])
-                ]) + "\n"
-            )
+            if surge:
+#                lines.append(f"{json.dumps(cert_data)}\n")
+#                lines.append(f"{json.dumps(result_info)}\n")
+#                lines.append(
+#                    f"{chain_subjects}\n"
+#                )
+                lines.append(
+                    json.dumps(
+                        {
+                            "type": cert_data['type'],
+                            "ctl_description": result_info['log_info']['description'],
+                            "ctl_operator": result_info['log_info']['operated_by'],
+                            "ctl_url": result_info['log_info']['url'],
+                            "ctl_cert_index": entry['cert_index'],
+                            "subject": cert_data['leaf_cert']['all_domains'][0],
+                            "all_domains": cert_data['leaf_cert']['all_domains'][1:],
+                            "root_ca": chain_subjects[-1],
+                            "certificate_chain_subjects": chain_subjects,
+                            "not_before": cert_data['leaf_cert']['not_before'],
+                            "not_after": cert_data['leaf_cert']['not_after']
+                        }
+                    ) + "\n"
+                )
+            else:
+              lines.append(
+                    ",".join([
+                        result_info['log_info']['url'],
+                        str(entry['cert_index']),
+                        chain_hash,
+                        cert_data['leaf_cert']['as_der'],
+                        ' '.join(cert_data['leaf_cert']['all_domains']),
+                        str(cert_data['leaf_cert']['not_before']),
+                        str(cert_data['leaf_cert']['not_after'])
+                    ]) + "\n"
+                )
 
-        print("[{}] Finished, writing CSV...".format(os.getpid()))
+        print("[{}] Finished, writing output...".format(os.getpid()))
 
-        with open(csv_file, 'w', encoding='utf8') as f:
-            f.write("".join(lines))
-        print("[{}] CSV {} written!".format(os.getpid(), csv_file))
+        if surge:
+            with bz2.open(f"{output_file}.bz2", 'wt', encoding='utf8') as f:
+                f.write("".join(lines))
+        else:
+            with open(output_file, 'w', encoding='utf8') as f:
+                f.write("".join(lines))
+    
+        print("[{}] output {} written!".format(os.getpid(), output_file))
 
     except Exception as e:
         print("========= EXCEPTION =========")
@@ -274,6 +332,8 @@ def main():
 
     parser.add_argument('-c', dest='concurrency_count', action='store', default=50, type=int, help="The number of concurrent downloads to run at a time")
 
+    parser.add_argument('--surge', dest="surge", action="store_true", help="Do things the Splunk SURGe way!")
+
     args = parser.parse_args()
 
     if args.list_mode:
@@ -290,9 +350,9 @@ def main():
     logging.info("Starting...")
 
     if args.ctl_url:
-        loop.run_until_complete(retrieve_certificates(loop, url=args.ctl_url, ctl_offset=int(args.ctl_offset), concurrency_count=args.concurrency_count, output_directory=args.output_dir))
+        loop.run_until_complete(retrieve_certificates(loop, url=args.ctl_url, ctl_offset=int(args.ctl_offset), concurrency_count=args.concurrency_count, output_directory=args.output_dir, surge=args.surge))
     else:
-        loop.run_until_complete(retrieve_certificates(loop, concurrency_count=args.concurrency_count, output_directory=args.output_dir))
+        loop.run_until_complete(retrieve_certificates(loop, concurrency_count=args.concurrency_count, output_directory=args.output_dir, surge=args.surge))
 
 if __name__ == "__main__":
     main()
