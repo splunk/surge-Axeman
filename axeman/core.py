@@ -138,7 +138,8 @@ async def processing_coro(download_results_queue, output_dir="/tmp", surge=False
 
     while True:
         entries_iter = []
-        logging.info("Getting things to process...")
+        if not surge:
+            logging.info("Getting things to process...")
         for _ in range(int(process_pool.pool_workers)):
             entries = await download_results_queue.get()
             if entries != None:
@@ -149,22 +150,18 @@ async def processing_coro(download_results_queue, output_dir="/tmp", surge=False
 
         logging.debug("Got a chunk of {}. Mapping into process pool".format(process_pool.pool_workers))
 
-        logging.info("***** SURGe: Getting entries.")
         for entry in entries_iter:
             output_storage = '{}/certificates/{}'.format(output_dir, entry['log_info']['url'].replace('/', '_'))
             if not os.path.exists(output_storage):
-                print("[{}] Making dir...".format(os.getpid()))
+                if surge:
+                    logging.info(f"[{os.getpid()}] Making dir...")
+                else:
+                    print("[{}] Making dir...".format(os.getpid()))
                 os.makedirs(output_storage)
             entry['log_dir']=output_storage
 
-        logging.info("***** SURGe: Got entries.")
-
         if len(entries_iter) > 0:
-            logging.info("***** SURGe: Mapping process_worker")
-#            await process_pool.coro_map(process_worker, entries_iter)
             await process_pool.coro_map(partial(process_worker, surge=surge), entries_iter)
-
-            logging.info("***** SURGe: Process worker done.")
 
         logging.debug("Done mapping! Got results")
 
@@ -177,8 +174,6 @@ async def processing_coro(download_results_queue, output_dir="/tmp", surge=False
 
 def process_worker(result_info, **kwargs):
     logging.debug("Worker {} starting...".format(os.getpid()))
-    logging.info(f"***** SURGe: Worker {os.getpid()} starting...")
-    logging.info(f"***** SURGE: kwargs: {kwargs}")
 
     if "surge" in kwargs.keys():
         surge = kwargs['surge']
@@ -197,7 +192,11 @@ def process_worker(result_info, **kwargs):
 
         lines = []
 
-        print("[{}] Parsing...".format(os.getpid()))
+        if surge:
+            logging.info(f"[{os.getpid()}] Parsing...")
+        else:
+            print("[{}] Parsing...".format(os.getpid()))
+
         for entry in result_info['entries']:
             mtl = certlib.MerkleTreeHeader.parse(base64.b64decode(entry['leaf_input']))
 
@@ -274,7 +273,10 @@ def process_worker(result_info, **kwargs):
                     ]) + "\n"
                 )
 
-        print("[{}] Finished, writing output...".format(os.getpid()))
+        if surge:
+            logging.info(f"[{os.getpid()}] Finished, writing output...")
+        else:
+            print("[{}] Finished, writing output...".format(os.getpid()))
 
         if surge:
             with bz2.open(f"{output_file}.bz2", 'wt', encoding='utf8') as f:
@@ -283,13 +285,21 @@ def process_worker(result_info, **kwargs):
             with open(output_file, 'w', encoding='utf8') as f:
                 f.write("".join(lines))
     
-        print("[{}] output {} written!".format(os.getpid(), output_file))
+        if surge:
+            logging.info(f"[{os.getpid()}] output {output_file} written!")
+        else:
+            print("[{}] output {} written!".format(os.getpid(), output_file))
 
     except Exception as e:
-        print("========= EXCEPTION =========")
-        traceback.print_exc()
-        print(e)
-        print("=============================")
+        if surge:
+            logging.error("========= EXCEPTION =========")
+            logging.exception(e)
+            logging.error("=============================")
+        else:
+            print("========= EXCEPTION =========")
+            traceback.print_exc()
+            print(e)
+            print("=============================")
 
     return True
 
@@ -334,13 +344,17 @@ def main():
 
     parser.add_argument('--surge', dest="surge", action="store_true", help="Do things the Splunk SURGe way!")
 
+    parser.add_argument('-q', dest="quiet", action="store_true", help="Don't print the log to STDOUT" )
+
     args = parser.parse_args()
 
     if args.list_mode:
         loop.run_until_complete(get_certs_and_print())
         return
 
-    handlers = [logging.FileHandler(args.log_file), logging.StreamHandler()]
+    handlers = [logging.FileHandler(args.log_file)]
+    if not args.quiet:
+        handlers.append(logging.StreamHandler())
 
     if args.verbose:
         logging.basicConfig(format='[%(levelname)s:%(name)s] %(asctime)s - %(message)s', level=logging.DEBUG, handlers=handlers)
